@@ -11,6 +11,7 @@ from django.conf import settings
 from django.core import serializers
 from django.db import router, DEFAULT_DB_ALIAS
 from django.db.models import get_apps
+from django.db.models.fields.related import ManyRelatedObjectsDescriptor, ReverseManyRelatedObjectsDescriptor, ForeignRelatedObjectsDescriptor
 
 try:
     import bz2
@@ -28,6 +29,7 @@ def tables_used_by_fixtures(fixture_labels, using=DEFAULT_DB_ALIAS):
     loaded_object_count = 0
     fixture_object_count = 0
     tables = set()
+    models_processed = set()
 
     class SingleZipReader(zipfile.ZipFile):
         def __init__(self, *args, **kwargs):
@@ -119,12 +121,16 @@ def tables_used_by_fixtures(fixture_labels, using=DEFAULT_DB_ALIAS):
                         # % (format, fixture_name, humanize(fixture_dir)))
                         try:
                             objects = serializers.deserialize(format, fixture, using=using)
+                            processing_model = None
                             for obj in objects:
+                                model_class = obj.object.__class__
                                 objects_in_fixture += 1
-                                if router.allow_syncdb(using, obj.object.__class__):
+                                if router.allow_syncdb(using, model_class) and processing_model != model_class:
                                     loaded_objects_in_fixture += 1
-                                    tables.add(
-                                        obj.object.__class__._meta.db_table)
+                                    tables = set(list(tables) + list(process_model_class(model_class)))
+
+                                processing_model = model_class
+
                             loaded_object_count += loaded_objects_in_fixture
                             fixture_object_count += objects_in_fixture
                             label_found = True
@@ -153,3 +159,32 @@ def tables_used_by_fixtures(fixture_labels, using=DEFAULT_DB_ALIAS):
                     pass
 
     return tables
+
+    def process_model_class(model_class):
+        tables = set()
+
+        if model_class in models_processed:
+            return tables
+
+        for field_name in model_class._meta.get_all_field_names():
+            field = getattr(model_class, field_name, None)
+            # Models with m2m relationships and no `through` model are
+            # not included among the tables to delete. A bit of inspection
+            # needs to be done so that we can retrieve those tables
+            if isinstance(field, ReverseManyRelatedObjectDescriptor):
+                tables.add(field.field._get_m2m_db_table(None))
+            if isinstance(field, ManyRelatedObjectsDescriptor):
+                tables.add(field.related.field._get_m2m_db_table(None))
+
+            # In some situations, related models can be created that
+            # also need to be eliminated, in order to detect them
+            # inspection needs to be done so that those related models
+            # are also deleted
+            if isinstance(field, ForeignRelatedObjectsDescriptor):
+                tables = set(list(tables) + list(self.process_model_class(field.related.field.model)))
+
+            tables.add(model_class._meta.dt_table)
+
+        models_processed.add(model_class)
+        return tables
+
